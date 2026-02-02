@@ -3,11 +3,22 @@ from scipy.sparse import csr_matrix, lil_matrix
 from scipy.sparse.linalg import spsolve, factorized
 from matplotlib import pyplot as plt
 from noise import pnoise2
+from time import time
+
+def time_decorator(func):
+    def wrapper(*args, **kwargs):
+        start_time = time()
+        result = func(*args, **kwargs)
+        end_time = time()
+        time_taken = end_time - start_time
+        print(f"Function '{func.__name__}' executed in {time_taken:.4f} seconds")
+        return time_taken, result
+    return wrapper
 
 def generate_film_random(size, threshold=0.5, seed=None):
     if seed is not None:
         np.random.seed(seed)
-    
+
     film = np.random.rand(size, size) > threshold
 
     return film.astype(bool)
@@ -17,7 +28,7 @@ def generate_film_perlin(size, scale=10, threshold=0.5, seed=None):
 
     if seed is None:
         seed = np.random.randint(0, 100)
-    
+
     perlin_noise = np.vectorize(lambda i, j: pnoise2(i / scale, j / scale, octaves=6, base=seed))(x, y)
 
     film = perlin_noise > threshold
@@ -31,12 +42,12 @@ class Film:
         self.resistence_values = resistence_values
 
         self.base_position = np.array(base_position)
-        
+
         #self.num_nodes = self.size * self.size
         #self.num_edges = 2 * self.num_nodes - 2 * self.size
-        
+
         #self.conductance_matrix = self._build_conductance_matrix()
-    
+
     def split(self, size):
         sub_grid_size = size - 1  # Overlap by 1 row/column
 
@@ -54,7 +65,7 @@ class Film:
                 #edge_indices[j // sub_grid_size].append(((i, i_end), (j, j_end)))
 
         return regions
-    
+
     @property
     def adj_matrices(self):
         if not hasattr(self, '_adj_matrices'):
@@ -94,11 +105,11 @@ class Film:
             adjacency_matrix[v_link_inds + W, v_link_inds] = 1
 
             adj_mats.append(csr_matrix(adjacency_matrix))
-        
+
         self._adj_matrices = adj_mats
 
         return adj_mats
-    
+
     @property
     def conductance_matrix(self):
         if not hasattr(self, '_conductance_matrix'):
@@ -138,6 +149,7 @@ class Film:
         self._network = Network(conductance_matrix, node_positions=positions)
         return self._network
 
+
 class Network:
     def __init__(self, conductance_matrix, node_positions=None):
 
@@ -169,9 +181,9 @@ class Network:
         # add a small regularization to the diagonal of G_II to ensure it's invertible
         G_II = G_II + regularization * csr_matrix(np.eye(G_II.shape[0]))
 
-        solve_G_II = factorized(G_II.tocsc()) 
-        Y = solve_G_II(G_IB.toarray()) 
-        correction_term = G_BI @ Y 
+        solve_G_II = factorized(G_II.tocsc())
+        Y = solve_G_II(G_IB.toarray())
+        correction_term = G_BI @ Y
         G_schur = G_BB - correction_term
 
         reduced_network = Network(G_schur, node_positions=self.node_mapping(keep_idx))
@@ -199,14 +211,14 @@ class Network:
             for i_local, i_global in enumerate(global_idx):
                 for j_local, j_global in enumerate(global_idx):
                     global_conductance[i_global, j_global] += local_G[i_local, j_local]
-        
+
         combine_network = Network(csr_matrix(global_conductance), node_positions=unique_positions)
 
         return combine_network
 
     def copy(self):
         return Network(self.conductance_matrix.copy(), node_positions=self.node_positions.copy() if self.node_positions is not None else None)
-    
+
     def solve(self, bound_nodes, bound_values, regularization=1e-12):
         G = self.conductance_matrix
         num_points = G.shape[0]
@@ -287,7 +299,7 @@ class ExperimentSimulation:
         self.film = Film(film_matrix, resistence_values)
 
         self.split_size = split_size
-        
+
         # Initialize some values to None, they will be computed when needed (they use a lot of memory and time)
         self._film_regions = None
         self._region_networks = None
@@ -301,7 +313,7 @@ class ExperimentSimulation:
          else:
              self._film_regions = self.film.split(self.split_size)
              return self._film_regions
-    
+
     @property
     def region_networks(self):
         if self._region_networks is not None:
@@ -309,7 +321,7 @@ class ExperimentSimulation:
         else:
             self._region_networks = [region.network for region in self.film_regions]
             return self._region_networks
-    
+
     @property
     def reduced_regions_network(self):
         if self._reduced_regions_network is not None:
@@ -318,7 +330,7 @@ class ExperimentSimulation:
             self._reduced_local_networks = []
             for region in self.film_regions:
                 H, W = region.size
-                
+
                 node_ids = np.arange(region.network.num_nodes)
 
                 # top and bottom rows
@@ -371,7 +383,26 @@ class ExperimentSimulation:
 
         return V_reduced, solved_positions
 
-def apply_lr_electrodes_and_solve(sim, v_bias):
+    @time_decorator
+    def timed_reduce_network(self):
+        self._reduced_regions_network = None
+        return self.reduced_regions_network
+
+    @time_decorator
+    def timed_film_regions(self):
+        self._film_regions = None
+        return self.film_regions
+
+    @time_decorator
+    def timed_region_networks(self):
+        self._region_networks = None
+        return self.region_networks
+
+    @time_decorator
+    def timed_solve_reduced_potentials(self, v_biases, bound_nodes):
+        return self.solve_reduced_potentials(v_biases, bound_nodes)
+
+def get_lr_electrodes_indices(sim):
     inds = np.arange(sim.reduced_regions_network.num_nodes)
     positions = sim.reduced_regions_network.node_mapping(inds)
 
@@ -381,10 +412,35 @@ def apply_lr_electrodes_and_solve(sim, v_bias):
 
     bound_nodes = np.concatenate((left_electrodes, right_grounds))
 
+    return bound_nodes, left_electrodes, right_grounds
+
+def apply_lr_electrodes_and_solve(sim, v_bias):
+    bound_nodes, left_electrodes, right_grounds = get_lr_electrodes_indices(sim)
+
     V_biases = np.zeros(len(left_electrodes) + len(right_grounds))
-    V_biases[:len(left_electrodes)] = 1.0  # set left electrodes to 1V
+    V_biases[:len(left_electrodes)] = v_bias  # set left electrodes to 1V
 
     #V_reduced, solved_positions = sim.solve_reduced_potentials(V_biases, bound_nodes)
     V_solution = sim.solve_potentials(V_biases, bound_nodes)
     return V_solution
 
+@time_decorator
+def timed_apply_lr_electrodes_and_solve(sim, v_bias):
+    return apply_lr_electrodes_and_solve(sim, v_bias)
+
+def plot_potentials(ax, potentials=None, electrode_positions=None, grounds_positions=None):
+
+    if potentials is not None:
+        t = ax.imshow(potentials)
+        plt.colorbar(t, ax=ax, label='Potential (V)')
+
+    if electrode_positions is not None:
+        ax.scatter(electrode_positions[:, 0], electrode_positions[:, 1], c='red', s=50, label='Electrodes')
+
+    if grounds_positions is not None:
+        ax.scatter(grounds_positions[:, 0], grounds_positions[:, 1], c='blue', s=50, label='Grounds')
+
+    if electrode_positions is not None or grounds_positions is not None:
+        ax.legend()
+
+    return ax
