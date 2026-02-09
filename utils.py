@@ -251,7 +251,7 @@ class Solver:
     Class responsible for managing the multi-scale solution process: splitting the grid, building local networks, reducing them,
     assembling the global coarse network, and performing the solve with back-substitution to get the full solution.
     """
-    def __init__(self, film_map, resistances, split_size=50, dbg=False):
+    def __init__(self, film_map, resistances, split_size=50):
         """
         Initialize the solver with the film map, resistances, and split size for the multi-scale approach.
 
@@ -264,73 +264,141 @@ class Solver:
         self.mesher = GridMesher(film_map, resistances)
         self.split_size = split_size
         self.shape = film_map.shape
-        self.dbg = dbg
 
-        # Storage
-        self.sub_networks = []      # Original local networks
-        self.reduced_networks = []  # Reduced networks (Schur)
+        self.n_chunks_y = (self.shape[0] + split_size - 1) // split_size
+        self.n_chunks_x = (self.shape[1] + split_size - 1) // split_size
+
+        self.sub_networks = [None] * (self.n_chunks_y * self.n_chunks_x)    # Original local networks
+        self.reduced_networks = [None] * (self.n_chunks_y * self.n_chunks_x)    # Reduced networks
+        
         self.coarse_network = None  # Assembled global network
+
         self.global_potentials_coarse = None
         self.full_solution = None
 
         self._build_hierarchy()
+    
+    def _get_chunk_index(self, r, c):
+        """
+        Internal helper function to get the chunk index from a global row and column index
 
-    def _build_hierarchy(self, dbg=False):
+        Args:
+            r (int): global row index for a pixel
+            c (int): global column index for a pixel
+
+        Returns:
+            tuple: chunk y index, chunk x index, linear index
+        """
+
+        cy = r // self.split_size
+        cx = c // self.split_size
+        idx = cy * self.n_chunks_x + cx
+
+        return cy, cx, idx
+
+    def _build_hierarchy(self):
         """
         Internal method to build the multi-scale hierarchy: split the grid, build local networks, reduce them, and assemble the coarse network.
+        Builds the network from scratch, should only be called on initialization or after big changes to the film map.
         """
 
         H, W = self.shape
         S = self.split_size
-
-        if dbg:
-            print("Building local networks...")
-
-        # logic for splitting the grid into chunks, while making sure to include an overlap of 1 pixel for connectivity.
+        
+        # Loop su tutti i chunk
         for r in range(0, H, S):
             for c in range(0, W, S):
-                r_end = min(r + S + 1, H)
-                c_end = min(c + S + 1, W)
+                cy, cx, idx = self._get_chunk_index(r, c)
+                self._rebuild_single_chunk(r, c, idx)
+                
+        self._reassemble_coarse()
 
-                r_limit = min(r + S, H)
-                c_limit = min(c + S, W)
+    def _rebuild_single_chunk(self, r_start, c_start, idx):
+        """
+        Build and reduce a single chunk defined by its starting row and column, and store the results in the corresponding index of sub_networks and reduced_networks.
+        """
 
-                r_slice_end = r_limit + 1 if r_limit < H else H
-                c_slice_end = c_limit + 1 if c_limit < W else W
+        H, W = self.shape
+        S = self.split_size
+        
+        # end positions with margin of 1 pixel for connectivity
+        r_end = min(r_start + S + 1, H)
+        c_end = min(c_start + S + 1, W)
+        
+        # Rebuild the local network (Grid -> Graph)
+        # Note: mesher reads from self.mesher.map, which must be already updated!
+        net = self.mesher.build_chunk(r_start, r_end, c_start, c_end)
+        self.sub_networks[idx] = net
+        
+        # Identify boundary nodes for Schur reduction
+        g_ids = net.global_indices
+        rows = g_ids // W
+        cols = g_ids % W
+        
+        # Boundary of the chunk WITH RESPECT TO the chunk itself (perimeter)
+        # Note: we use min/max of the global indices of THIS chunk
+        r_min, r_max = rows.min(), rows.max()
+        c_min, c_max = cols.min(), cols.max()
+        
+        is_boundary = (rows == r_min) | (rows == r_max) | \
+                      (cols == c_min) | (cols == c_max)
+        
+        # Perform Schur reduction
+        self.reduced_networks[idx] = net.reduce(keep_mask=is_boundary)
 
-                net = self.mesher.build_chunk(r, r_slice_end, c, c_slice_end)
-                self.sub_networks.append(net)
+    def _reassemble_coarse(self):
+        """
+        Reassemble the global network by merging the reduced pieces
+        """
+        self.coarse_network = LinearNetwork.merge(self.reduced_networks, 
+                                                  total_unique_nodes=self.shape[0]*self.shape[1])
+    
+    def update_grid(self, changed_pixels):
+        """
+        Update the solver by recalculating ONLY the chunks affected by the changed pixels.
+        
+        :param changed_pixels: list or array of tuples (r, c, new_value)
+        """
 
-        if self.dbg:
-            print("Reducing local networks...")
+        if not changed_pixels:
+            return
 
-        # reduction of each local network to keep only the boundary nodes (interface with the coarse network)
-        for net in self.sub_networks:
-            # identify boundary nodes in the local network based on their global indices
-            g_ids = net.global_indices
-            rows = g_ids // W
-            cols = g_ids % W
+        changed_chunks_idxs = set()
+        
+        for r, c, val in changed_pixels:
+            self.mesher.map[r, c] = val
+            _, _, idx = self._get_chunk_index(r, c)
+            changed_chunks_idxs.add(idx)
+            
+            # Check if we are on the top edge of the current chunk (and not at the absolute edge 0)
+            if r % self.split_size == 0 and r > 0:
+                 _, _, idx_up = self._get_chunk_index(r - 1, c)
+                 changed_chunks_idxs.add(idx_up)
+            
+            # Check left edge
+            if c % self.split_size == 0 and c > 0:
+                _, _, idx_left = self._get_chunk_index(r, c - 1)
+                changed_chunks_idxs.add(idx_left)
 
-            r_min, r_max = rows.min(), rows.max()
-            c_min, c_max = cols.min(), cols.max()
+        # Rebuild only the affected chunks
+        S = self.split_size
+        for idx in changed_chunks_idxs:
+            # Retrieve top-left coordinates of the chunk from the linear index
+            cy = idx // self.n_chunks_x
+            cx = idx % self.n_chunks_x
+            r_start = cy * S
+            c_start = cx * S
+             
+            self._rebuild_single_chunk(r_start, c_start, idx)
 
-            is_boundary = (rows == r_min) | (rows == r_max) | \
-                          (cols == c_min) | (cols == c_max)
+        # Rebuild the coarse network after all local updates are done
+        self._reassemble_coarse()
 
-            reduced = net.reduce(keep_mask=is_boundary)
-            self.reduced_networks.append(reduced)
-
-        if self.dbg:
-            print("Assembling coarse network...")
-
-        # merge the reduced networks into a single coarse network
-        self.coarse_network = LinearNetwork.merge(self.reduced_networks, total_unique_nodes=H*W)
-
-    def solve(self, bound_coords, bound_values, dbg=False):
+    def solve(self, bound_coords, bound_values):
         """
         Solve for the potentials given boundary conditions specified by bound_coords and bound_values.
 
-        bound_coords: lista di tuple o array (N, 2) con (y, x)
+        bound_coords: list of tuples or array (N, 2) with (y, x)
         bound_values: array (N,)
         """
 
@@ -339,13 +407,7 @@ class Solver:
         bound_ids = self.mesher.get_global_id(bound_coords[:, 0], bound_coords[:, 1])
 
         # solve the coarse system first
-        if dbg:
-            print("Solving coarse system...")
-
         V_coarse = self.coarse_network.solve_local(bound_ids, bound_values)
-
-        if dbg:
-            print("Resolving local details...")
 
         # prepare the full solution map
         full_map = np.zeros(self.shape)
@@ -377,16 +439,13 @@ class Solver:
         return full_map
 
     @time_decorator
-    def _build_hierarchy_timed(self, dbg=False):
+    def _build_hierarchy_timed(self):
         """
         Internal method to build the multi-scale hierarchy: split the grid, build local networks, reduce them, and assemble the coarse network.
         """
 
         H, W = self.shape
         S = self.split_size
-
-        if dbg:
-            print("Building local networks...")
 
         # logic for splitting the grid into chunks, while making sure to include an overlap of 1 pixel for connectivity.
         for r in range(0, H, S):
@@ -402,9 +461,6 @@ class Solver:
 
                 net = self.mesher.build_chunk(r, r_slice_end, c, c_slice_end)
                 self.sub_networks.append(net)
-
-        if self.dbg:
-            print("Reducing local networks...")
 
         # reduction of each local network to keep only the boundary nodes (interface with the coarse network)
         for net in self.sub_networks:
@@ -429,7 +485,7 @@ class Solver:
         self.coarse_network = LinearNetwork.merge(self.reduced_networks, total_unique_nodes=H*W)
 
     @time_decorator
-    def solve_timed(self, bound_coords, bound_values, dbg=False):
+    def solve_timed(self, bound_coords, bound_values):
         """
         Solve for the potentials given boundary conditions specified by bound_coords and bound_values.
 
@@ -442,13 +498,7 @@ class Solver:
         bound_ids = self.mesher.get_global_id(bound_coords[:, 0], bound_coords[:, 1])
 
         # solve the coarse system first
-        if dbg:
-            print("Solving coarse system...")
-
         V_coarse = self.coarse_network.solve_local(bound_ids, bound_values)
-
-        if dbg:
-            print("Resolving local details...")
 
         # prepare the full solution map
         full_map = np.zeros(self.shape)
@@ -648,8 +698,8 @@ class Simulation:
         Also handles time evolution of the system.
     """
 
-    def __init__(self, film_map, resistances=(1, 100, 10000), split_size=50, dbg=False):
-        self.solver = Solver(film_map, resistances, split_size=split_size, dbg=dbg)
+    def __init__(self, film_map, resistances=(1, 100, 10000), split_size=50):
+        self.solver = Solver(film_map, resistances, split_size=split_size)
         self.analysis = ElectricalAnalysis(self.solver)
         self.film_map = film_map
         self.maps = None
@@ -770,6 +820,8 @@ class Simulation:
 
         electrodes, grounds, all_bound = self.get_electrodes_coords()
 
+        change_pixels = []  # list to keep track of changed pixels for updating the solver later
+
         # --- EVOLUTION LOGIC ---
         # first, we compute the maps on the film
         # we then build binary maps, selecting pixels above the threshold for E and P
@@ -803,6 +855,8 @@ class Simulation:
                 r_swap, c_swap = swap_target
                 # Swap the values in the film map
                 self.film_map[r, c], self.film_map[r_swap, c_swap] = self.film_map[r_swap, c_swap], self.film_map[r, c]
+                change_pixels.append((r, c, 1)) # void -> matter
+                change_pixels.append((r_swap, c_swap, 0)) # matter -> void
         
         # perform the swaps for P evolution (matter -> void)
         for r, c in evolve_P_coords:
@@ -811,10 +865,14 @@ class Simulation:
                 r_swap, c_swap = swap_target
                 # Swap the values in the film map
                 self.film_map[r, c], self.film_map[r_swap, c_swap] = self.film_map[r_swap, c_swap], self.film_map[r, c]
+                change_pixels.append((r, c, 0)) # matter -> void
+                change_pixels.append((r_swap, c_swap, 1)) # void -> matter
         
-        # rebuild the solver and analysis with the updated film map for the next iteration
-        # Note: temporary, easy to implement solution. Only the affected local network should be updated!!!
-        self.solver = Solver(self.film_map, self.solver.mesher.resistances, split_size=self.solver.split_size, dbg=self.solver.dbg)
+        # update the solver with the changed pixels to avoid rebuilding the entire hierarchy
+        if change_pixels:
+             self.solver.update_grid(change_pixels)
+        
+        # still rebuild the analysis object. Should be fast enough for now
         self.analysis = ElectricalAnalysis(self.solver)
 
     def compute_total_current(self):
