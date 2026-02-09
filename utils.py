@@ -1,9 +1,11 @@
-import numpy as np
-from scipy.sparse import csr_matrix, lil_matrix
-from scipy.sparse.linalg import spsolve, factorized
 from matplotlib import pyplot as plt
+from matplotlib.colors import LogNorm
+from matplotlib import cm
 from noise import pnoise2
 from time import time
+import numpy as np
+from scipy.sparse import coo_matrix, eye, triu
+from scipy.sparse.linalg import spsolve, factorized
 
 def time_decorator(func):
     def wrapper(*args, **kwargs):
@@ -14,6 +16,663 @@ def time_decorator(func):
         print(f"Function '{func.__name__}' executed in {time_taken:.4f} seconds")
         return time_taken, result
     return wrapper
+
+class LinearNetwork:
+    """
+    Abstraction for a generic linear resistive network represented by its conductance matrix.
+    Nodes are indexed locally (0..N-1) within the network, but can be mapped to global indices, if a global map is provided.
+    """
+    def __init__(self, conductance_matrix, global_indices=None):
+        """
+        Initialize a linear network with a given conductance matrix and optional global index mapping.
+
+        :param conductance_matrix: the conductance matrix (sparse csr_matrix)
+        :param global_indices: array mapping local node indices to global indices
+        """
+        self.G = conductance_matrix
+        self.num_nodes = self.G.shape[0]
+
+        # global_indices maps local indices 0..N to unique global problem indices
+        self.global_indices = global_indices if global_indices is not None else np.arange(self.num_nodes)
+
+    def reduce(self, keep_mask, regularization=1e-12):
+        """
+        Reduce the network by eliminating nodes that are not in the keep_mask using Schur Complement.
+
+        :param keep_mask: Boolean array of length num_nodes indicating which nodes to keep (True) and which to eliminate (False)
+        :param regularization: Regularization parameter added to the diagonal of the eliminated block to ensure numerical stability
+        """
+
+        keep_idx = np.where(keep_mask)[0]
+        rem_idx = np.where(~keep_mask)[0]
+
+        if len(rem_idx) == 0:
+            return self
+
+        # Efficient slicing of sparse matrices
+        G_BB = self.G[keep_idx, :][:, keep_idx]
+        G_BI = self.G[keep_idx, :][:, rem_idx]
+        G_IB = self.G[rem_idx, :][:, keep_idx]
+        G_II = self.G[rem_idx, :][:, rem_idx]
+
+        # Regularization and factorization
+        if regularization > 0:
+            G_II += regularization * eye(G_II.shape[0], format='csr')
+
+        solve_II = factorized(G_II.tocsc())
+
+        # Schur: G_new = A - B * inv(D) * C
+        # Note: we use the linear operator to avoid explicit inversion
+        Y = solve_II(G_IB.toarray())
+        # If G_IB is very large, it's better to use solve on sparse columns or iterative methods,
+        # but for local blocks .toarray() is ok.
+
+        G_schur = G_BB - G_BI @ Y
+
+        return LinearNetwork(G_schur, global_indices=self.global_indices[keep_idx])
+
+    def solve_local(self, boundary_indices, boundary_values, regularization=1e-12):
+        """
+        Solve the network given potentials on some nodes (boundary).
+
+        :param boundary_indices: Indices of nodes with fixed potentials (boundary nodes)
+        :param boundary_values: Potential values at the boundary nodes
+        :param regularization: Regularization parameter added to the diagonal of the free block to ensure numerical stability
+        """
+
+        all_indices = np.arange(self.num_nodes)
+
+        # Map input (which could be global or local indices) to local
+        # Here we assume boundary_indices are already LOCAL indices (0..N) for speed
+        free_mask = np.ones(self.num_nodes, dtype=bool)
+        free_mask[boundary_indices] = False
+        free_idx = np.where(free_mask)[0]
+
+        if len(free_idx) == 0:
+            V = np.zeros(self.num_nodes)
+            V[boundary_indices] = boundary_values
+            return V
+
+        G_FF = self.G[free_idx, :][:, free_idx]
+        G_FB = self.G[free_idx, :][:, boundary_indices]
+
+        if regularization > 0:
+            G_FF += regularization * eye(G_FF.shape[0])
+
+        b = -G_FB @ boundary_values
+        V_free = spsolve(G_FF, b)
+
+        V = np.zeros(self.num_nodes)
+        V[boundary_indices] = boundary_values
+        V[free_idx] = V_free
+        return V
+
+    @staticmethod
+    def merge(networks, total_unique_nodes=None):
+        """
+        Merge multiple LinearNetwork instances into a single global network. This is done by summing the conductance contributions of all networks at their respective global indices.
+
+        :param networks: List of LinearNetwork instances to merge
+        :param total_unique_nodes: Optional total number of unique global nodes across all networks. If not provided, it will be computed from the maximum global index.
+        """
+
+        rows, cols, data = [], [], []
+
+        # If we don't know the total number of unique nodes, calculate it
+        if total_unique_nodes is None:
+            max_idx = 0
+            for net in networks:
+                max_idx = max(max_idx, np.max(net.global_indices))
+            total_unique_nodes = max_idx + 1
+
+        for net in networks:
+            # Convert to COO to extract triplets (r, c, v)
+            coo = coo_matrix(net.G)#net.G.tocoo()
+
+            # Map local indices to global
+            global_r = net.global_indices[coo.row]
+            global_c = net.global_indices[coo.col]
+
+            rows.append(global_r)
+            cols.append(global_c)
+            data.append(coo.data)
+
+        # Concatenate everything in a single pass
+        all_rows = np.concatenate(rows)
+        all_cols = np.concatenate(cols)
+        all_data = np.concatenate(data)
+
+        # The creation of coo_matrix automatically sums duplicates (interface nodes)
+        G_global = coo_matrix((all_data, (all_rows, all_cols)), shape=(total_unique_nodes, total_unique_nodes)).tocsr()
+
+        return LinearNetwork(G_global, global_indices=np.arange(total_unique_nodes))
+
+class GridMesher:
+    """
+    Class responsible for converting a 2D grid map of the film into a LinearNetwork representation, handling the local connectivity and resistances based on the types of nodes (MM, MD, DD).
+    """
+    def __init__(self, film_map, resistances):
+        self.map = film_map
+        self.H, self.W = film_map.shape
+        self.resistances = resistances # (mm, md, dd)
+
+    def get_global_id(self, r, c):
+        """
+        Return a unique global ID for the node at position (r, c) in the grid.
+        (Works on numpy arrays)
+
+        :param r: Row index or array of row indices
+        :param c: Column index or array of column indices
+        """
+
+        return r * self.W + c
+
+    def build_chunk(self, r_start, r_end, c_start, c_end):
+        """
+        Split the grid into a chunk defined by the given row and column ranges, and build a LinearNetwork for that chunk.
+
+        :param r_start: start row index (inclusive). Equivalent to the y coordinate of the top-left corner of the chunk.
+        :param r_end: end row index (exclusive). Equivalent to the y coordinate of the bottom-right corner of the chunk.
+        :param c_start: start column index (inclusive). Equivalent to the x coordinate of the top-left corner of the chunk.
+        :param c_end: end column index (exclusive). Equivalent to the x coordinate of the bottom-right corner of the chunk.
+        """
+
+        # Extract the slice with a margin of 1 pixel if possible for connections,
+        sub_map = self.map[r_start:r_end, c_start:c_end]
+        h_sub, w_sub = sub_map.shape
+
+        # Create local nodes
+        # Create a grid of global IDs corresponding to this patch
+        rows = np.arange(r_start, r_end).reshape(-1, 1)
+        cols = np.arange(c_start, c_end).reshape(1, -1)
+        # Broadcasting to get matrix of global IDs
+        global_ids = (rows * self.W + cols).flatten()
+
+        # Build the adjacency matrix (similar to your original code but optimized)
+        # Here we use heavy vectorization
+        flat_map = sub_map.flatten()
+
+        # Define neighbors (right and down)
+        # Indices in the local flattened vector (0..h*w-1)
+        idx = np.arange(h_sub * w_sub).reshape(h_sub, w_sub)
+
+        # Horizontal links (Right)
+        mask_h = (idx[:, :-1]).flatten()
+        mask_h_next = (idx[:, 1:]).flatten()
+        # Vertical links (Down)
+        mask_v = (idx[:-1, :]).flatten()
+        mask_v_next = (idx[1:, :]).flatten()
+
+        # Compute conductances for all links in a vectorized way
+        vals_h = self._compute_conductance(flat_map[mask_h], flat_map[mask_h_next])
+        vals_v = self._compute_conductance(flat_map[mask_v], flat_map[mask_v_next])
+
+        # Assemble local COO
+        src = np.concatenate([mask_h, mask_v, mask_h_next, mask_v_next])
+        dst = np.concatenate([mask_h_next, mask_v_next, mask_h, mask_v])
+        dat = np.concatenate([vals_h, vals_v, vals_h, vals_v]) # Symmetric
+
+        # Add diagonal
+        diag_row = np.arange(h_sub * w_sub)
+        # Sum over rows for negative diagonal (Kirchhoff)
+        G_temp = coo_matrix((dat, (src, dst)), shape=(h_sub*w_sub, h_sub*w_sub))
+        diag_val = -np.array(G_temp.sum(axis=1)).flatten()
+
+        # Final combination
+        G_final = G_temp + coo_matrix((diag_val, (diag_row, diag_row)), shape=(h_sub*w_sub, h_sub*w_sub))
+
+        return LinearNetwork(G_final.tocsr(), global_indices=global_ids)
+
+    def _compute_conductance(self, type_a, type_b):
+        """
+        Compute the conductances on a set of nodes, based on their types (MM, MD, DD).
+
+        :param type_a: An array describing the type of the first node in each pair (M, D)
+        :param type_b: An array describing the type of the second node in each pair (M, D)
+        """
+
+        mm, md, dd = self.resistances
+        cond = np.zeros_like(type_a, dtype=float)
+
+        # Bitwise logic on booleans or integers of the map
+        is_mm = type_a & type_b
+        is_dd = (~type_a) & (~type_b)
+        is_md = type_a != type_b
+
+        # Note: off-diagonal entries are negative conductances, and the diagonal will be the negative sum of the row (Kirchhoff's law)
+        cond[is_mm] = -1.0/mm
+        cond[is_dd] = -1.0/dd
+        cond[is_md] = -1.0/md
+
+        return cond
+
+class Solver:
+    """
+    Class responsible for managing the multi-scale solution process: splitting the grid, building local networks, reducing them,
+    assembling the global coarse network, and performing the solve with back-substitution to get the full solution.
+    """
+    def __init__(self, film_map, resistances, split_size=50, dbg=False):
+        """
+        Initialize the solver with the film map, resistances, and split size for the multi-scale approach.
+
+        :param film_map: 2d array representing the film, where each value indicates the type of node (e.g., M or D)
+        :param resistances: tuple of resistances (mm, md, dd) corresponding to the types of connections
+        :param split_size: size of the chunks to split the grid into for local network construction
+        :param dbg: boolean flag for enabling debug mode
+        """
+
+        self.mesher = GridMesher(film_map, resistances)
+        self.split_size = split_size
+        self.shape = film_map.shape
+        self.dbg = dbg
+
+        # Storage
+        self.sub_networks = []      # Original local networks
+        self.reduced_networks = []  # Reduced networks (Schur)
+        self.coarse_network = None  # Assembled global network
+        self.global_potentials_coarse = None
+        self.full_solution = None
+
+        self._build_hierarchy()
+
+    def _build_hierarchy(self, dbg=False):
+        """
+        Internal method to build the multi-scale hierarchy: split the grid, build local networks, reduce them, and assemble the coarse network.
+        """
+
+        H, W = self.shape
+        S = self.split_size
+
+        if dbg:
+            print("Building local networks...")
+
+        # logic for splitting the grid into chunks, while making sure to include an overlap of 1 pixel for connectivity.
+        for r in range(0, H, S):
+            for c in range(0, W, S):
+                r_end = min(r + S + 1, H)
+                c_end = min(c + S + 1, W)
+
+                r_limit = min(r + S, H)
+                c_limit = min(c + S, W)
+
+                r_slice_end = r_limit + 1 if r_limit < H else H
+                c_slice_end = c_limit + 1 if c_limit < W else W
+
+                net = self.mesher.build_chunk(r, r_slice_end, c, c_slice_end)
+                self.sub_networks.append(net)
+
+        if self.dbg:
+            print("Reducing local networks...")
+
+        # reduction of each local network to keep only the boundary nodes (interface with the coarse network)
+        for net in self.sub_networks:
+            # identify boundary nodes in the local network based on their global indices
+            g_ids = net.global_indices
+            rows = g_ids // W
+            cols = g_ids % W
+
+            r_min, r_max = rows.min(), rows.max()
+            c_min, c_max = cols.min(), cols.max()
+
+            is_boundary = (rows == r_min) | (rows == r_max) | \
+                          (cols == c_min) | (cols == c_max)
+
+            reduced = net.reduce(keep_mask=is_boundary)
+            self.reduced_networks.append(reduced)
+
+        if self.dbg:
+            print("Assembling coarse network...")
+
+        # merge the reduced networks into a single coarse network
+        self.coarse_network = LinearNetwork.merge(self.reduced_networks, total_unique_nodes=H*W)
+
+    def solve(self, bound_coords, bound_values, dbg=False):
+        """
+        Solve for the potentials given boundary conditions specified by bound_coords and bound_values.
+
+        bound_coords: lista di tuple o array (N, 2) con (y, x)
+        bound_values: array (N,)
+        """
+
+        # map the boundary coordinates to global node IDs
+        bound_coords = np.array(bound_coords)
+        bound_ids = self.mesher.get_global_id(bound_coords[:, 0], bound_coords[:, 1])
+
+        # solve the coarse system first
+        if dbg:
+            print("Solving coarse system...")
+
+        V_coarse = self.coarse_network.solve_local(bound_ids, bound_values)
+
+        if dbg:
+            print("Resolving local details...")
+
+        # prepare the full solution map
+        full_map = np.zeros(self.shape)
+
+        # solve each sub-network with the boundary values obtained from the coarse solution
+        for sub_net in self.sub_networks:
+
+            local_ids_global = sub_net.global_indices
+
+            known_values = V_coarse[local_ids_global]
+
+            # build the mask for boundary nodes in the local sub-network
+            rows = local_ids_global // self.shape[1]
+            cols = local_ids_global % self.shape[1]
+            r_min, r_max = rows.min(), rows.max()
+            c_min, c_max = cols.min(), cols.max()
+            is_boundary = (rows == r_min) | (rows == r_max) | \
+                          (cols == c_min) | (cols == c_max)
+
+            local_boundary_indices = np.where(is_boundary)[0]
+            local_boundary_values = known_values[is_boundary]
+
+            V_local = sub_net.solve_local(local_boundary_indices, local_boundary_values)
+
+            # fill in the full solution
+            full_map[rows, cols] = V_local
+
+        self.full_solution = full_map
+        return full_map
+
+    @time_decorator
+    def _build_hierarchy_timed(self, dbg=False):
+        """
+        Internal method to build the multi-scale hierarchy: split the grid, build local networks, reduce them, and assemble the coarse network.
+        """
+
+        H, W = self.shape
+        S = self.split_size
+
+        if dbg:
+            print("Building local networks...")
+
+        # logic for splitting the grid into chunks, while making sure to include an overlap of 1 pixel for connectivity.
+        for r in range(0, H, S):
+            for c in range(0, W, S):
+                r_end = min(r + S + 1, H)
+                c_end = min(c + S + 1, W)
+
+                r_limit = min(r + S, H)
+                c_limit = min(c + S, W)
+
+                r_slice_end = r_limit + 1 if r_limit < H else H
+                c_slice_end = c_limit + 1 if c_limit < W else W
+
+                net = self.mesher.build_chunk(r, r_slice_end, c, c_slice_end)
+                self.sub_networks.append(net)
+
+        if self.dbg:
+            print("Reducing local networks...")
+
+        # reduction of each local network to keep only the boundary nodes (interface with the coarse network)
+        for net in self.sub_networks:
+            # identify boundary nodes in the local network based on their global indices
+            g_ids = net.global_indices
+            rows = g_ids // W
+            cols = g_ids % W
+
+            r_min, r_max = rows.min(), rows.max()
+            c_min, c_max = cols.min(), cols.max()
+
+            is_boundary = (rows == r_min) | (rows == r_max) | \
+                          (cols == c_min) | (cols == c_max)
+
+            reduced = net.reduce(keep_mask=is_boundary)
+            self.reduced_networks.append(reduced)
+
+        if self.dbg:
+            print("Assembling coarse network...")
+
+        # merge the reduced networks into a single coarse network
+        self.coarse_network = LinearNetwork.merge(self.reduced_networks, total_unique_nodes=H*W)
+
+    @time_decorator
+    def solve_timed(self, bound_coords, bound_values, dbg=False):
+        """
+        Solve for the potentials given boundary conditions specified by bound_coords and bound_values.
+
+        bound_coords: lista di tuple o array (N, 2) con (y, x)
+        bound_values: array (N,)
+        """
+
+        # map the boundary coordinates to global node IDs
+        bound_coords = np.array(bound_coords)
+        bound_ids = self.mesher.get_global_id(bound_coords[:, 0], bound_coords[:, 1])
+
+        # solve the coarse system first
+        if dbg:
+            print("Solving coarse system...")
+
+        V_coarse = self.coarse_network.solve_local(bound_ids, bound_values)
+
+        if dbg:
+            print("Resolving local details...")
+
+        # prepare the full solution map
+        full_map = np.zeros(self.shape)
+
+        # solve each sub-network with the boundary values obtained from the coarse solution
+        for sub_net in self.sub_networks:
+
+            local_ids_global = sub_net.global_indices
+
+            known_values = V_coarse[local_ids_global]
+
+            # build the mask for boundary nodes in the local sub-network
+            rows = local_ids_global // self.shape[1]
+            cols = local_ids_global % self.shape[1]
+            r_min, r_max = rows.min(), rows.max()
+            c_min, c_max = cols.min(), cols.max()
+            is_boundary = (rows == r_min) | (rows == r_max) | \
+                          (cols == c_min) | (cols == c_max)
+
+            local_boundary_indices = np.where(is_boundary)[0]
+            local_boundary_values = known_values[is_boundary]
+
+            V_local = sub_net.solve_local(local_boundary_indices, local_boundary_values)
+
+            # fill in the full solution
+            full_map[rows, cols] = V_local
+
+        self.full_solution = full_map
+        return full_map
+
+class ElectricalAnalysis:
+    """
+    Class responsible for computing power and current density maps from the solved potentials and the network structure,
+    """
+    def __init__(self, solver):
+        """
+        Initialize the analysis, by passing the solver.
+
+        :param solver: a Solver instance containing the network structure
+        """
+
+        self.solver = solver
+        self.H, self.W = solver.shape
+
+    def compute_maps(self, dtype=np.float32):
+        """
+        Compute the power density and current density maps based on the solved voltages and the network structure.
+        This function avoids building the full global conductance matrix, and instead streams through the local networks.
+
+        :param dtype: data type for the output maps. Default is np.float32.
+        :return: dictionary with keys 'power_density', 'current_density', 'I_x', 'I_y'
+        """
+
+        self.V = self.solver.full_solution
+
+        # Allocate memory for the output maps
+        P_map = np.zeros((self.H, self.W), dtype=dtype)
+        Ix_map = np.zeros((self.H, self.W), dtype=dtype) # Current X component
+        Iy_map = np.zeros((self.H, self.W), dtype=dtype) # Current Y component
+
+        for net in self.solver.sub_networks:
+            # extracts the conductance links from the local network. Only the upper triangular part is needed to avoid double counting.
+            G_upper = triu(net.G, k=1) # k=1 excludes the diagonal (sums)
+            coo = G_upper.tocoo()
+
+            if coo.nnz == 0: continue
+
+            # map to global indices and extract conductance values
+            idx_i = net.global_indices[coo.row] # Node A
+            idx_j = net.global_indices[coo.col] # Node B
+            g_val = -coo.data # Conductance (positive) of the link
+
+            # Retrieve Global Voltages
+            V_i = self.V.flat[idx_i]
+            V_j = self.V.flat[idx_j]
+
+            # compute current and power for each link
+            dV = V_i - V_j
+            I_link = g_val * dV       # Current flowing from i to j
+            P_link = I_link * dV      # Power dissipated on the link (always positive)
+
+            # convert global indices to 2D coordinates
+            yi, xi = np.divmod(idx_i, self.W)
+            yj, xj = np.divmod(idx_j, self.W)
+
+            # add the power contributions to the power density map (averaging over the two nodes)
+            np.add.at(P_map, (yi, xi), 0.5 * P_link)
+            np.add.at(P_map, (yj, xj), 0.5 * P_link)
+
+            # find the type of link (horizontal or vertical)
+            diff = np.abs(idx_i - idx_j)
+
+            # --- Horizontal Links (diff == 1) ---
+            mask_h = (diff == 1)
+            if np.any(mask_h):
+                # If current flows from i -> j (Left -> Right), it is positive
+                # We are accumulating the "passing" magnitude for the node
+                val_h = np.abs(I_link[mask_h])
+                # Assign to the left and right node (rough spatial average)
+                np.add.at(Ix_map, (yi[mask_h], xi[mask_h]), val_h * 0.5)
+                np.add.at(Ix_map, (yj[mask_h], xj[mask_h]), val_h * 0.5)
+
+            # --- Vertical Links (diff == W) ---
+            mask_v = (diff == self.W)
+            if np.any(mask_v):
+                val_v = np.abs(I_link[mask_v])
+                np.add.at(Iy_map, (yi[mask_v], xi[mask_v]), val_v * 0.5)
+                np.add.at(Iy_map, (yj[mask_v], xj[mask_v]), val_v * 0.5)
+
+        # Compute final current magnitude
+        J_map = np.sqrt(Ix_map**2 + Iy_map**2)
+
+        return {
+            'power_density': P_map,
+            'current_density': J_map,
+            'I_x': Ix_map,
+            'I_y': Iy_map
+        }
+
+    @time_decorator
+    def compute_maps_timed(self, dtype=np.float32):
+        """
+        Compute the power density and current density maps based on the solved voltages and the network structure.
+        This function avoids building the full global conductance matrix, and instead streams through the local networks.
+
+        :param dtype: data type for the output maps. Default is np.float32.
+        :return: dictionary with keys 'power_density', 'current_density', 'I_x', 'I_y'
+        """
+
+        # Allocate memory for the output maps
+        P_map = np.zeros((self.H, self.W), dtype=dtype)
+        Ix_map = np.zeros((self.H, self.W), dtype=dtype) # Current X component
+        Iy_map = np.zeros((self.H, self.W), dtype=dtype) # Current Y component
+
+        for net in self.solver.sub_networks:
+            # extracts the conductance links from the local network. Only the upper triangular part is needed to avoid double counting.
+            G_upper = triu(net.G, k=1) # k=1 excludes the diagonal (sums)
+            coo = G_upper.tocoo()
+
+            if coo.nnz == 0: continue
+
+            # map to global indices and extract conductance values
+            idx_i = net.global_indices[coo.row] # Node A
+            idx_j = net.global_indices[coo.col] # Node B
+            g_val = -coo.data # Conductance (positive) of the link
+
+            # Retrieve Global Voltages
+            V_i = self.V.flat[idx_i]
+            V_j = self.V.flat[idx_j]
+
+            # compute current and power for each link
+            dV = V_i - V_j
+            I_link = g_val * dV       # Current flowing from i to j
+            P_link = I_link * dV      # Power dissipated on the link (always positive)
+
+            # convert global indices to 2D coordinates
+            yi, xi = np.divmod(idx_i, self.W)
+            yj, xj = np.divmod(idx_j, self.W)
+
+            # add the power contributions to the power density map (averaging over the two nodes)
+            np.add.at(P_map, (yi, xi), 0.5 * P_link)
+            np.add.at(P_map, (yj, xj), 0.5 * P_link)
+
+            # find the type of link (horizontal or vertical)
+            diff = np.abs(idx_i - idx_j)
+
+            # --- Horizontal Links (diff == 1) ---
+            mask_h = (diff == 1)
+            if np.any(mask_h):
+                # If current flows from i -> j (Left -> Right), it is positive
+                # We are accumulating the "passing" magnitude for the node
+                val_h = np.abs(I_link[mask_h])
+                # Assign to the left and right node (rough spatial average)
+                np.add.at(Ix_map, (yi[mask_h], xi[mask_h]), val_h * 0.5)
+                np.add.at(Ix_map, (yj[mask_h], xj[mask_h]), val_h * 0.5)
+
+            # --- Vertical Links (diff == W) ---
+            mask_v = (diff == self.W)
+            if np.any(mask_v):
+                val_v = np.abs(I_link[mask_v])
+                np.add.at(Iy_map, (yi[mask_v], xi[mask_v]), val_v * 0.5)
+                np.add.at(Iy_map, (yj[mask_v], xj[mask_v]), val_v * 0.5)
+
+        # Compute final current magnitude
+        J_map = np.sqrt(Ix_map**2 + Iy_map**2)
+
+        return {
+            'power_density': P_map,
+            'current_density': J_map,
+            'I_x': Ix_map,
+            'I_y': Iy_map
+        }
+
+class Simulation:
+    def __init__(self, film_map, resistances=(1, 100, 1000), split_size=50, dbg=False):
+        self.solver = Solver(film_map, resistances, split_size=split_size, dbg=dbg)
+        self.analysis = ElectricalAnalysis(self.solver)
+
+    def solve_all(self, bound_coords, bound_values):
+        self.solver.solve(bound_coords, bound_values)
+        maps = self.analysis.compute_maps()
+        maps['voltage'] = self.solver.full_solution
+        self.maps = maps
+        return maps
+
+    def get_electrodes_coords(self):
+        """
+        Returns the coordinates of the left and right electrodes in the grid.
+        Return format: array (H, 2) of integers.
+        """
+
+        H, W = self.solver.shape
+        rows = np.arange(H)
+
+        # left electrode (Column 0): pairs [0,0], [1,0], ...
+        left_coords = np.column_stack((rows, np.zeros(H, dtype=int)))
+
+        # right electrode (Column W-1): pairs [0,W-1], [1,W-1], ...
+        right_coords = np.column_stack((rows, np.full(H, W - 1, dtype=int)))
+
+        # Combine both for convenience
+        all_coords = np.vstack((left_coords, right_coords))
+
+        return left_coords, right_coords, all_coords
 
 def generate_film_random(size, threshold=0.5, seed=None):
     if seed is not None:
@@ -31,416 +690,114 @@ def generate_film_perlin(size, scale=10, threshold=0.5, seed=None):
 
     perlin_noise = np.vectorize(lambda i, j: pnoise2(i / scale, j / scale, octaves=6, base=seed))(x, y)
 
-    film = perlin_noise > threshold
+    film = perlin_noise < threshold
 
     return film.astype(bool)
 
-class Film:
-    def __init__(self, map, resistence_values=(1.0, 10**(6), 10**(7)), base_position=(0,0)):
-        self.map = map
-        self.size = map.shape
-        self.resistence_values = resistence_values
+def plot_on_film_map(film_map, data, ax=None, percentile=None, colorbar=True, log_scale=False, cmap_name='inferno'):
+    """
+    Plot an overlay of data (e.g., current density) on top of the film map, using a glow effect.
+
+    :param film_map: 2D array representing the film (boolean or binary)
+    :param data: 2D array of data to overlay on the film map (e.g., current density)
+    :param ax: Matplotlib Axes object to plot on. If None, a new figure and axes are created.
+    :param percentile: Percentile to determine the minimum value for normalization (used to hide low "noise" values)
+    :param colorbar: Whether to show a colorbar or not
+    :param log_scale: Whether to use logarithmic scale for normalization
+    :return: Matplotlib Axes object with the plot
+    """
 
-        self.base_position = np.array(base_position)
-
-        #self.num_nodes = self.size * self.size
-        #self.num_edges = 2 * self.num_nodes - 2 * self.size
-
-        #self.conductance_matrix = self._build_conductance_matrix()
-
-    def split(self, size):
-        sub_grid_size = size - 1  # Overlap by 1 row/column
-
-        regions = []
-
-        #edge_indices = [[] for _ in range(0, self.size, sub_grid_size)]
-
-        for i in range(0, self.size[0], sub_grid_size):
-            for j in range(0, self.size[1], sub_grid_size):
-                i_end = min(i + size, self.size[0])
-                j_end = min(j + size, self.size[1])
-                region_map = self.map[i:i_end, j:j_end]
-                base_pos = (j, i) + self.base_position
-                regions.append(Film(region_map, self.resistence_values, base_position=base_pos))
-                #edge_indices[j // sub_grid_size].append(((i, i_end), (j, j_end)))
-
-        return regions
-
-    @property
-    def adj_matrices(self):
-        if not hasattr(self, '_adj_matrices'):
-            self.build_adjacency_matrix()
-        return self._adj_matrices
-
-    def build_adjacency_matrix(self):
-        # build multiple adj matrices, representing different connections (metal-metal, metal-dielectric, dielectric-dielectric)
-
-        H, W = self.map.shape
-        N = H * W
-
-        node_ids = np.arange(N).reshape(H, W)
-
-        h_links_mm = self.map[:, :-1] & self.map[:, 1:]
-        v_links_mm = self.map[:-1, :] & self.map[1:, :]
-
-        h_links_md = (self.map[:, :-1] != self.map[:, 1:])
-        v_links_md = (self.map[:-1, :] != self.map[1:, :])
-
-        h_links_dd = (~self.map[:, :-1]) & (~self.map[:, 1:])
-        v_links_dd = (~self.map[:-1, :]) & (~self.map[1:, :])
-
-        links = [(h_links_mm, v_links_mm), (h_links_md, v_links_md), (h_links_dd, v_links_dd)]
-
-        adj_mats = []
-
-        for h_link, v_link in links:
-            adjacency_matrix = lil_matrix((N, N), dtype=bool)
-
-            h_link_inds = node_ids[:, :-1][h_link]
-            v_link_inds = node_ids[:-1, :][v_link]
-
-            adjacency_matrix[h_link_inds, h_link_inds + 1] = 1
-            adjacency_matrix[h_link_inds + 1, h_link_inds] = 1
-            adjacency_matrix[v_link_inds, v_link_inds + W] = 1
-            adjacency_matrix[v_link_inds + W, v_link_inds] = 1
-
-            adj_mats.append(csr_matrix(adjacency_matrix))
-
-        self._adj_matrices = adj_mats
-
-        return adj_mats
-
-    @property
-    def conductance_matrix(self):
-        if not hasattr(self, '_conductance_matrix'):
-            self.build_conductance_matrix()
-        return self._conductance_matrix
-
-    def build_conductance_matrix(self):
-        mm_resistance, md_resistance, dd_resistance = self.resistence_values
-
-        conductance_matrix = lil_matrix(self.adj_matrices[0].shape, dtype=float)
-
-        conductance_matrix += self.adj_matrices[0] * (-1 / mm_resistance)
-        conductance_matrix += self.adj_matrices[1] * (-1 / md_resistance)
-        conductance_matrix += self.adj_matrices[2] * (-1 / dd_resistance)
-
-        diagonal_values = np.array(-conductance_matrix.sum(axis=1)).flatten()
-        conductance_matrix.setdiag(diagonal_values)
-
-        conductance_matrix = csr_matrix(conductance_matrix)
-
-        self._conductance_matrix = conductance_matrix
-
-        return conductance_matrix
-
-    @property
-    def network(self):
-        if not hasattr(self, '_network'):
-            self.build_network()
-        return self._network
-
-    def build_network(self):
-        conductance_matrix = self.build_conductance_matrix()
-
-        # an array mapping each node to its (x, y) position
-        positions = self.base_position + np.array([[j, i] for i in range(self.size[0]) for j in range(self.size[1])])
-
-        self._network = Network(conductance_matrix, node_positions=positions)
-        return self._network
-
-
-class Network:
-    def __init__(self, conductance_matrix, node_positions=None):
-
-        self.conductance_matrix = conductance_matrix
-        self.num_nodes = conductance_matrix.shape[0]
-
-        self.node_positions = node_positions
-
-    def node_mapping(self, x):
-        if self.node_positions is None:
-            return x
-        else:
-            return self.node_positions[x]
-
-    def reduce(self, keep_mask, regularization=1e-12):
-
-        remove_mask = ~keep_mask
-
-        keep_idx = np.where(keep_mask)[0]
-        remove_idx = np.where(remove_mask)[0]
-
-        G = self.conductance_matrix
-
-        G_BB = G[keep_idx, :][:, keep_idx]
-        G_BI = G[keep_idx, :][:, remove_idx]
-        G_IB = G[remove_idx, :][:, keep_idx]
-        G_II = G[remove_idx, :][:, remove_idx]
-
-        # add a small regularization to the diagonal of G_II to ensure it's invertible
-        G_II = G_II + regularization * csr_matrix(np.eye(G_II.shape[0]))
-
-        solve_G_II = factorized(G_II.tocsc())
-        Y = solve_G_II(G_IB.toarray())
-        correction_term = G_BI @ Y
-        G_schur = G_BB - correction_term
-
-        reduced_network = Network(G_schur, node_positions=self.node_mapping(keep_idx))
-
-        return reduced_network
-
-    def join_networks(self, other_networks):
-        networks = [self, *other_networks]
-
-        all_positions = np.vstack([net.node_positions for net in networks])
-        unique_positions, inverse_indices = np.unique(all_positions, axis=0, return_inverse=True)
-
-        global_indices_per_network = []
-        start = 0
-        for net in networks:
-            n = net.node_positions.shape[0]
-            global_indices_per_network.append(inverse_indices[start:start+n])
-            start += n
-
-        N = unique_positions.shape[0]
-        global_conductance = lil_matrix((N, N), dtype=float)
-
-        for net, global_idx in zip(networks, global_indices_per_network):
-            local_G = net.conductance_matrix
-            for i_local, i_global in enumerate(global_idx):
-                for j_local, j_global in enumerate(global_idx):
-                    global_conductance[i_global, j_global] += local_G[i_local, j_local]
-
-        combine_network = Network(csr_matrix(global_conductance), node_positions=unique_positions)
-
-        return combine_network
-
-    def copy(self):
-        return Network(self.conductance_matrix.copy(), node_positions=self.node_positions.copy() if self.node_positions is not None else None)
-
-    def solve(self, bound_nodes, bound_values, regularization=1e-12):
-        G = self.conductance_matrix
-        num_points = G.shape[0]
-
-        bound_indices = np.array(bound_nodes)
-        free_indices = np.setdiff1d(np.arange(num_points), bound_indices)
-
-        G_BB = G[bound_indices[:, None], bound_indices]
-        G_BF = G[bound_indices[:, None], free_indices]
-        G_FB = G[free_indices[:, None], bound_indices]
-        G_FF = G[free_indices[:, None], free_indices]
-
-        G_FF = G_FF + regularization * csr_matrix(np.eye(G_FF.shape[0]))  # regularization to avoid singular matrix
-        G_FB = G_FB + regularization * csr_matrix(np.eye(G_FB.shape[0], G_FB.shape[1]))  # regularization to avoid singular matrix
-
-        V_B = np.array(bound_values)
-
-        b = -G_FB @ V_B
-        V_free = spsolve(G_FF, b)
-
-        # combine the potentials into a single array
-        V = np.zeros(num_points)
-        V[bound_indices] = V_B
-        V[free_indices] = V_free
-
-        return V
-
-    def compute_currents(self, potentials):
-        G = self.conductance_matrix
-        I = G @ potentials
-        return I
-
-def intersect_networks_indices(networks):
-    all_positions = np.vstack([net.node_positions for net in networks])
-    unique_positions, inverse_indices, counts = np.unique(all_positions, axis=0, return_inverse=True, return_counts=True)
-
-    intersect_positions = unique_positions[counts > 1]
-
-    intersect_indices_per_network = []
-    start = 0
-    for net in networks:
-        n = net.node_positions.shape[0]
-        net_indices = inverse_indices[start:start+n]
-        intersect_indices = [i for i, pos in enumerate(net_indices) if unique_positions[pos] in intersect_positions]
-        intersect_indices_per_network.append(intersect_indices)
-        start += n
-
-    return intersect_indices_per_network
-
-def plot_network(network, ax=None, dot_color="blue", line_color='gray'):
     if ax is None:
-        fig, ax = plt.subplots()
+        fig, ax = plt.subplots(figsize=(10, 10))
 
-    positions = network.node_positions
+    # plot the background film map in grayscale
+    ax.imshow(film_map, cmap='gray', interpolation='nearest', alpha=1.0)
 
-    G = network.conductance_matrix
+    J = data.copy()
+    J = np.maximum(J, 1e-20)    # avoids log(0)
 
-    gmax = np.max(G)
-    gmin = np.min(G)
-    #print(gmin, gmax)
+    if percentile is not None:
+        vmin = np.percentile(J, percentile)
 
-    for i in range(network.num_nodes):
-        for j in range(network.num_nodes):
-            v = G[i, j]
-            if i < j and v < 0:
-                pos_i = positions[i]
-                pos_j = positions[j]
-                alpha = v / gmin    #(v - gmin) / (gmax - gmin + 1e-12)
-                ax.plot([pos_i[0], pos_j[0]], [pos_i[1], pos_j[1]], color=line_color, linewidth=0.5, alpha=alpha)
+    else:
+        vmin = J.min()
 
-    ax.scatter(positions[:, 0], positions[:, 1], s=10, color=dot_color)
+    vmax = J.max()
 
-    return ax
+    # If the map is flat (all zero or constant), avoid division by zero
+    if vmax <= vmin:
+        vmax = vmin + 1e-12
 
-class ExperimentSimulation:
-    def __init__(self, film_matrix, resistence_values=(1.0, 10**(6), 10**(7)), split_size=10):
+    if log_scale:
+        # --- MANUAL LOGARITHMIC NORMALIZATION (0.0 -> 1.0) ---
+        # Formula: (log(x) - log(min)) / (log(max) - log(min))
+        log_J = np.log10(J)
+        log_min = np.log10(vmin)
+        log_max = np.log10(vmax)
 
-        self.film = Film(film_matrix, resistence_values)
+        norm_data = (log_J - log_min) / (log_max - log_min)
+    else:
+        # --- LINEAR NORMALIZATION (0.0 -> 1.0) ---
+        norm_data = (J - vmin) / (vmax - vmin)
 
-        self.split_size = split_size
+    # clip values to [0, 1]
+    norm_data = np.clip(norm_data, 0.0, 1.0)
 
-        # Initialize some values to None, they will be computed when needed (they use a lot of memory and time)
-        self._film_regions = None
-        self._region_networks = None
-        self._reduced_local_networks = []
-        self._reduced_regions_network = None
+    cmap = plt.get_cmap(cmap_name)
 
-    @property
-    def film_regions(self):
-         if self._film_regions is not None:
-             return self._film_regions
-         else:
-             self._film_regions = self.film.split(self.split_size)
-             return self._film_regions
+    # cmap(value) returns (R, G, B, A) with values 0-1
+    rgba_img = cmap(norm_data)
 
-    @property
-    def region_networks(self):
-        if self._region_networks is not None:
-            return self._region_networks
-        else:
-            self._region_networks = [region.network for region in self.film_regions]
-            return self._region_networks
+    # Modify Alpha Channel (Transparency)
+    # Use normalized data to decide opacity.
+    # alpha = 0 -> completely transparent (film visible underneath)
+    # alpha = 1 -> full color
+    rgba_img[:, :, 3] = norm_data
 
-    @property
-    def reduced_regions_network(self):
-        if self._reduced_regions_network is not None:
-            return self._reduced_regions_network
-        else:
-            self._reduced_local_networks = []
-            for region in self.film_regions:
-                H, W = region.size
+    # make values below noise threshold completely transparent
+    rgba_img[norm_data <= 0.0, 3] = 0.0
 
-                node_ids = np.arange(region.network.num_nodes)
+    ax.imshow(rgba_img)
+    ax.axis('off')
 
-                # top and bottom rows
-                mask = node_ids % W == 0
-                mask |= node_ids % W == W - 1
-
-                # left and right columns
-                mask |= node_ids // W == 0
-                mask |= node_ids // W == H - 1
-
-                self._reduced_local_networks.append(region.network.reduce(mask))
-            self._reduced_regions_network = self._reduced_local_networks[0].join_networks(self._reduced_local_networks[1:])
-            return self._reduced_regions_network
-
-    def solve_potentials(self, v_biases, bound_nodes):
-        V_reduced, solved_positions = self.solve_reduced_potentials(v_biases, bound_nodes)
-
-        V_full = np.zeros_like(self.film.map, dtype=float)
-        count_full = np.zeros_like(self.film.map, dtype=float)
-
-        for region in self.film_regions:
-            net = region.network
-            net_pos = net.node_positions  # shape (N, 2), (x, y) global positions
-
-            # find the corresponding nodes in the reduced network
-            mask = np.array([np.any(np.all(solved_positions == pos, axis=1)) for pos in net_pos])
-            bound_nodes = np.where(mask)[0]
-            bound_values = V_reduced[[np.where(np.all(solved_positions == pos, axis=1))[0][0] for pos in net_pos[mask]]]
-
-            V_region = net.solve(bound_nodes, bound_values)
-
-            # For each node in the region, add its value to the correct (y, x) in V_full
-            for idx, (x, y) in enumerate(net_pos):
-                xg, yg = int(x), int(y)
-                if 0 <= yg < V_full.shape[0] and 0 <= xg < V_full.shape[1]:
-                    V_full[yg, xg] += V_region[idx]
-                    count_full[yg, xg] += 1
-
-        # Avoid division by zero
-        mask = count_full > 0
-        V_full[mask] /= count_full[mask]
-
-        return V_full
-
-    def solve_reduced_potentials(self, v_biases, bound_nodes):
-        bound_values = np.array(v_biases)
-
-        V_reduced = self.reduced_regions_network.solve(bound_nodes, bound_values)
-        solved_positions = self.reduced_regions_network.node_positions
-
-        return V_reduced, solved_positions
-
-    @time_decorator
-    def timed_reduce_network(self):
-        self._reduced_regions_network = None
-        return self.reduced_regions_network
-
-    @time_decorator
-    def timed_film_regions(self):
-        self._film_regions = None
-        return self.film_regions
-
-    @time_decorator
-    def timed_region_networks(self):
-        self._region_networks = None
-        return self.region_networks
-
-    @time_decorator
-    def timed_solve_reduced_potentials(self, v_biases, bound_nodes):
-        return self.solve_reduced_potentials(v_biases, bound_nodes)
-
-def get_lr_electrodes_indices(sim):
-    inds = np.arange(sim.reduced_regions_network.num_nodes)
-    positions = sim.reduced_regions_network.node_mapping(inds)
-
-    # electrodes are placed on the left and grounds on the right
-    left_electrodes = np.where(positions[:, 0] < 1)[0]
-    right_grounds = np.where(positions[:, 0] > sim.film.size[1] - 2)[0]
-
-    bound_nodes = np.concatenate((left_electrodes, right_grounds))
-
-    return bound_nodes, left_electrodes, right_grounds
-
-def apply_lr_electrodes_and_solve(sim, v_bias):
-    bound_nodes, left_electrodes, right_grounds = get_lr_electrodes_indices(sim)
-
-    V_biases = np.zeros(len(left_electrodes) + len(right_grounds))
-    V_biases[:len(left_electrodes)] = v_bias  # set left electrodes to 1V
-
-    #V_reduced, solved_positions = sim.solve_reduced_potentials(V_biases, bound_nodes)
-    V_solution = sim.solve_potentials(V_biases, bound_nodes)
-    return V_solution
-
-@time_decorator
-def timed_apply_lr_electrodes_and_solve(sim, v_bias):
-    return apply_lr_electrodes_and_solve(sim, v_bias)
-
-def plot_potentials(ax, potentials=None, electrode_positions=None, grounds_positions=None):
-
-    if potentials is not None:
-        t = ax.imshow(potentials)
-        plt.colorbar(t, ax=ax, label='Potential (V)')
-
-    if electrode_positions is not None:
-        ax.scatter(electrode_positions[:, 0], electrode_positions[:, 1], c='red', s=50, label='Electrodes')
-
-    if grounds_positions is not None:
-        ax.scatter(grounds_positions[:, 0], grounds_positions[:, 1], c='blue', s=50, label='Grounds')
-
-    if electrode_positions is not None or grounds_positions is not None:
-        ax.legend()
+    if colorbar:
+        plt.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax)), ax=ax)
 
     return ax
+
+def plot_streamlines_on_film(film_map, Ix, Iy, ax=None, step=20):
+    """
+    Plot streamlines for a vector field (Ix, Iy) (usually current flow) on top of the film map.
+
+    :param film_map: 2D array representing the film (boolean or binary)
+    :param Ix: 2D array representing the x-component of the vector field
+    :param Iy: 2D array representing the y-component of the vector field
+    :param ax: Matplotlib Axes object to plot on. If None, a new figure and axes are created.
+    :param step: Step size for downsampling the vector field for plotting
+    """
+
+    if ax is None: fig, ax = plt.subplots(figsize=(10, 10))
+
+    H, W = film_map.shape
+
+    # plot the film map as background
+    ax.imshow(film_map, cmap='binary', alpha=0.3)
+
+    # build a downsampled grid for streamlines
+    y, x = np.mgrid[0:H:step, 0:W:step]
+
+    # Extract downsampled vectors
+    u = Ix[::step, ::step]
+    v = Iy[::step, ::step]
+
+    # Calculate magnitude for coloring the lines
+    speed = np.sqrt(u**2 + v**2)
+
+    # 'density' controls how dense the lines are
+    strm = ax.streamplot(x, y, u, v, color=speed, cmap='autumn',
+                         linewidth=1, density=1.5, arrowsize=1.0)
+
+    ax.set_title("Current Flow Direction")
+    ax.invert_yaxis() # Important because images have (0,0) at the top
+    return ax
+
