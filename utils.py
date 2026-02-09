@@ -643,16 +643,97 @@ class ElectricalAnalysis:
         }
 
 class Simulation:
-    def __init__(self, film_map, resistances=(1, 100, 1000), split_size=50, dbg=False):
+    """
+        High-level class that encapsulates the entire simulation process: from building the solver to computing the maps and providing utility functions for electrode coordinates.
+        Also handles time evolution of the system.
+    """
+
+    def __init__(self, film_map, resistances=(1, 100, 10000), split_size=50, dbg=False):
         self.solver = Solver(film_map, resistances, split_size=split_size, dbg=dbg)
         self.analysis = ElectricalAnalysis(self.solver)
+        self.film_map = film_map
+        self.maps = None
 
     def solve_all(self, bound_coords, bound_values):
+        """
+        Compute voltage, current and power dissipation maps
+
+        Args:
+            bound_coords (np.array): numpy array of indices for the bound nodes
+            bound_values (np.array): numpy array containing the values for the bias voltages
+
+        Returns:
+            dict: a dictionary containing the computed maps. Available keys are voltage, power_density, current_density, I_x, I_y, E_field
+        """
+
         self.solver.solve(bound_coords, bound_values)
         maps = self.analysis.compute_maps()
         maps['voltage'] = self.solver.full_solution
+
+        grad_y, grad_x = np.gradient(maps['voltage'])
+        E_mag = np.sqrt(grad_x**2 + grad_y**2)
+        maps['E_field'] = E_mag
+
         self.maps = maps
+
         return maps
+
+    def find_nearest_swap_target(self, r, c, target_val, radius=5):
+        """
+        Find the nearest available pixel for the swap
+
+        Args:
+            r (int): row index of the center of the search window
+            c (int): column index of the center of the search window
+            target_val (bool): value to search for within the window
+            radius (int, optional): radius of the search window. Defaults to 5.
+
+        Returns:
+            tuple or None: coordinates of the nearest available pixel or None if not found
+        """
+
+        H, W = self.solver.shape
+        
+        # find the window borders, making sure to stay within the image boundaries
+        r_min = max(0, r - radius)
+        r_max = min(H, r + radius + 1)
+        c_min = max(0, c - radius)
+        c_max = min(W, c + radius + 1)
+        
+        # extract a local window around (r, c)
+        window = self.film_map[r_min:r_max, c_min:c_max]
+        
+        # find the indices RELATIVE to the window where window == target_val
+        # np.argwhere returns an array (N, 2) of coordinates [row, col]
+        candidates_rel = np.argwhere(window == target_val)
+        
+        if len(candidates_rel) == 0:
+            return None
+        
+        # calculate the relative center of the window (corresponds to global r, c)
+        center_rel = np.array([r - r_min, c - c_min])
+        
+        # calculate squared distances from (r,c)
+        dists_sq = np.sum((candidates_rel - center_rel)**2, axis=1)
+        
+        # find the minimum distance
+        min_dist = np.min(dists_sq)
+        
+        # filter only the candidates that are at that minimum distance
+        best_candidates_idx = np.where(dists_sq == min_dist)[0]
+        
+        # choose one at random among the best
+        chosen_idx = np.random.choice(best_candidates_idx)
+        chosen_rel = candidates_rel[chosen_idx]
+        
+        # Convert to global coordinates
+        global_pos = (r_min + chosen_rel[0], c_min + chosen_rel[1])
+        
+        # sanity check: if the found position is the same as the input (r, c), we can return None to indicate no valid swap target
+        if global_pos == (r, c):
+            return None
+            
+        return global_pos
 
     def get_electrodes_coords(self):
         """
@@ -674,6 +755,88 @@ class Simulation:
 
         return left_coords, right_coords, all_coords
 
+    def _evolve_step(self, E_threshold, P_threshold, swap_radius=5, bias_v=1.0, E_prob=0.5, P_prob=0.5):
+        """
+        Perform a single evolution step on the system
+
+        Args:
+            swap_radius (int, optional): Size of the window used when searching for a swap candidate. Defaults to 5.
+            bias_v (float, optional): Bias voltage applied during the evolution step. Defaults to 1.0.
+            E_threshold (float, optional): Threshold for selecting high E field pixels.
+            P_threshold (float, optional): Threshold for selecting high power density pixels.
+            E_prob (float, optional): Probability of evolving a high E field pixel. Defaults to 0.5.
+            P_prob (float, optional): Probability of evolving a high power density pixel. Defaults to 0.5.
+        """
+
+        electrodes, grounds, all_bound = self.get_electrodes_coords()
+
+        # --- EVOLUTION LOGIC ---
+        # first, we compute the maps on the film
+        # we then build binary maps, selecting pixels above the threshold for E and P
+        # the maps are then used to select pixels to evolve (swap) with a certain probability
+        # a void pixel with high enough E can become matter
+        # a matter pixel with high enough P can become void
+        # when a pixel is changed, another pixel of the opposite type is randomly selected within a certain radius to swap with, to keep the total amount of matter constant
+
+        maps = self.solve_all(all_bound, np.concatenate((np.full(electrodes.shape[0], bias_v), np.zeros(grounds.shape[0]))))
+
+        E_map = maps['E_field']
+        P_map = maps['power_density']
+
+        # create binary masks for high E and high P pixels
+        high_E_mask = (E_map > E_threshold) & (self.film_map == 0) # only consider void pixels for E evolution
+        high_P_mask = (P_map > P_threshold) & (self.film_map == 1) # only consider matter pixels for P evolution
+
+        # create two maps with random values (0-1), compare them with the probabilities to decide which pixels will evolve
+        # these maps are then multiplied element-wise (binary and) with the high_E_mask and high_P_mask to get the final selection of pixels to evolve
+        evolve_E = (np.random.rand(*E_map.shape) < E_prob) & high_E_mask
+        evolve_P = (np.random.rand(*P_map.shape) < P_prob) & high_P_mask
+
+        # get the coordinates of the pixels to evolve
+        evolve_E_coords = np.argwhere(evolve_E)
+        evolve_P_coords = np.argwhere(evolve_P)
+
+        # perform the swaps for E evolution (void -> matter)
+        for r, c in evolve_E_coords:
+            swap_target = self.find_nearest_swap_target(r, c, target_val=True, radius=swap_radius)
+            if swap_target is not None:
+                r_swap, c_swap = swap_target
+                # Swap the values in the film map
+                self.film_map[r, c], self.film_map[r_swap, c_swap] = self.film_map[r_swap, c_swap], self.film_map[r, c]
+        
+        # perform the swaps for P evolution (matter -> void)
+        for r, c in evolve_P_coords:
+            swap_target = self.find_nearest_swap_target(r, c, target_val=False, radius=swap_radius)
+            if swap_target is not None:
+                r_swap, c_swap = swap_target
+                # Swap the values in the film map
+                self.film_map[r, c], self.film_map[r_swap, c_swap] = self.film_map[r_swap, c_swap], self.film_map[r, c]
+        
+        # rebuild the solver and analysis with the updated film map for the next iteration
+        # Note: temporary, easy to implement solution. Only the affected local network should be updated!!!
+        self.solver = Solver(self.film_map, self.solver.mesher.resistances, split_size=self.solver.split_size, dbg=self.solver.dbg)
+        self.analysis = ElectricalAnalysis(self.solver)
+
+    def compute_total_current(self):
+        """
+        Compute the total current trough the system
+
+        Returns:
+            float: the total current
+        """
+
+        if self.maps is None:
+            raise ValueError("Maps not computed yet. Please run solve_all() first.")
+
+        Ix = self.maps['I_x']
+        Iy = self.maps['I_y']
+
+        # Total current can be computed by summing the current components at the electrodes
+        # Assuming left electrode is the source and right electrode is the sink, we can sum the currents at the left edge (Column 0)
+        total_current = np.sum(Ix[:, 0]) # Sum of currents entering from the left edge
+
+        return total_current
+        
 def generate_film_random(size, threshold=0.5, seed=None):
     if seed is not None:
         np.random.seed(seed)
