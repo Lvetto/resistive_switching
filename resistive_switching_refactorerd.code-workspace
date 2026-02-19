@@ -1,0 +1,61 @@
+{
+  "folders": [
+    {
+      "path": "."
+    }
+  ],
+  "settings": {
+    "editor.formatOnSave": true,
+    "editor.insertSpaces": true,
+    "editor.tabSize": 2,
+    "files.trimTrailingWhitespace": true,
+    "files.exclude": {
+      "out": false,
+      "dist": true,
+      ".node_modules": true,
+      "**/.DS_Store": true,
+      "**/__pycache__": true,
+      "**/*.pyc": true
+    },
+    "search.exclude": {
+      "out": true,
+      "dist": true,
+      ".node_modules": true,
+      "__pycache__": true
+    },
+    "python.analysis.autoImportCompletions": true,
+    "python.analysis.typeCheckingMode": "basic",
+    "python.formatting.provider": "black",
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": true,
+    "python.testing.pytestEnabled": true,
+    "[python]": {
+      "editor.tabSize": 4,
+      "editor.defaultFormatter": "ms-python.black-formatter"
+    },
+    "python.defaultInterpreterPath": "/home/luca/miniconda3/envs/quantum_sim/bin/python",
+    "python.condaPath": "/home/luca/miniconda3/bin/conda",
+    "python.terminal.activateEnvironment": true,
+    "terminal.integrated.defaultProfile.linux": "conda-env",
+    "terminal.integrated.profiles.linux": {
+      "conda-env": {
+        "path": "/bin/bash",
+        "args": [
+          "-l",
+          "-c",
+          "source /home/luca/miniconda3/etc/profile.d/conda.sh && conda activate quantum_sim >/dev/null 2>&1; PYV=$(python --version 2>/dev/null); MSG=\"Python: ${PYV}\"; if command -v node >/dev/null 2>&1; then MSG=\"${MSG}; Node: $(node --version 2>/dev/null)\"; fi; if command -v npm >/dev/null 2>&1; then MSG=\"${MSG}; npm: $(npm --version 2>/dev/null)\"; fi; printf '\\033[32m🐍 Ambiente quantum_sim attivato!\\033[0m: \\033[36m%s\\033[0m\\n' \"${MSG}\"; /bin/bash -l"
+        ]
+      }
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-python.python",
+      "ms-python.vscode-pylance",
+      "ms-python.black-formatter",
+      "ms-python.flake8",
+      "ms-python.isort",
+      "ms-toolsai.jupyter"
+    ]
+  }
+}
