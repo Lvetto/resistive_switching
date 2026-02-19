@@ -596,7 +596,8 @@ class ElectricalAnalysis:
             if np.any(mask_h):
                 # If current flows from i -> j (Left -> Right), it is positive
                 # We are accumulating the "passing" magnitude for the node
-                val_h = np.abs(I_link[mask_h])
+                #val_h = np.abs(I_link[mask_h])
+                val_h = I_link[mask_h] # We want to keep the sign for visualization of current direction
                 # Assign to the left and right node (rough spatial average)
                 np.add.at(Ix_map, (yi[mask_h], xi[mask_h]), val_h * 0.5)
                 np.add.at(Ix_map, (yj[mask_h], xj[mask_h]), val_h * 0.5)
@@ -604,7 +605,7 @@ class ElectricalAnalysis:
             # --- Vertical Links (diff == W) ---
             mask_v = (diff == self.W)
             if np.any(mask_v):
-                val_v = np.abs(I_link[mask_v])
+                val_v = I_link[mask_v] # We want to keep the sign for visualization of current direction
                 np.add.at(Iy_map, (yi[mask_v], xi[mask_v]), val_v * 0.5)
                 np.add.at(Iy_map, (yj[mask_v], xj[mask_v]), val_v * 0.5)
 
@@ -670,7 +671,7 @@ class ElectricalAnalysis:
             if np.any(mask_h):
                 # If current flows from i -> j (Left -> Right), it is positive
                 # We are accumulating the "passing" magnitude for the node
-                val_h = np.abs(I_link[mask_h])
+                val_h = I_link[mask_h] # We want to keep the sign for visualization of current direction
                 # Assign to the left and right node (rough spatial average)
                 np.add.at(Ix_map, (yi[mask_h], xi[mask_h]), val_h * 0.5)
                 np.add.at(Ix_map, (yj[mask_h], xj[mask_h]), val_h * 0.5)
@@ -678,7 +679,8 @@ class ElectricalAnalysis:
             # --- Vertical Links (diff == W) ---
             mask_v = (diff == self.W)
             if np.any(mask_v):
-                val_v = np.abs(I_link[mask_v])
+                #val_v = np.abs(I_link[mask_v])
+                val_v = I_link[mask_v] # We want to keep the sign for visualization of current direction
                 np.add.at(Iy_map, (yi[mask_v], xi[mask_v]), val_v * 0.5)
                 np.add.at(Iy_map, (yj[mask_v], xj[mask_v]), val_v * 0.5)
 
@@ -848,6 +850,10 @@ class Simulation:
         evolve_E_coords = np.argwhere(evolve_E)
         evolve_P_coords = np.argwhere(evolve_P)
 
+        # shuffle the coordinates to avoid any bias in the order of processing (should fix a bug causing anysotropy in time evolution)
+        np.random.shuffle(evolve_E_coords)
+        np.random.shuffle(evolve_P_coords)
+
         # perform the swaps for E evolution (void -> matter)
         for r, c in evolve_E_coords:
             swap_target = self.find_nearest_swap_target(r, c, target_val=True, radius=swap_radius)
@@ -874,6 +880,16 @@ class Simulation:
         
         # still rebuild the analysis object. Should be fast enough for now
         self.analysis = ElectricalAnalysis(self.solver)
+
+    def evolve(self, steps, E_threshold, P_threshold, swap_radius=5, bias_v=1.0, E_prob=0.5, P_prob=0.5):
+        maps = []
+        for step in range(steps):
+            print(f"Evolution step {step+1}/{steps}...")
+            self._evolve_step(E_threshold, P_threshold, swap_radius, bias_v, E_prob, P_prob)
+            maps.append(self.maps)
+            maps[-1]["film_map"] = self.film_map.copy() # also save the film map at each step for visualization
+
+        return maps
 
     def compute_total_current(self):
         """
